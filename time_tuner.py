@@ -451,6 +451,91 @@ class TimeTuner(object):
             return x, intermediates
         return x
 
+    def optimize_timesteps(self,
+                           data_loader,
+                           step_fn,
+                           encode_fn=None,
+                           num_steps=None,
+                           timesteps=None,
+                           tune_type='sequential',
+                           lr=2e-3,
+                           total_iters=500,
+                           verbose=False,
+                           **kwargs):
+        if tune_type not in ['sequential', 'parallel']:
+            raise ValueError(f'Unsupported tune type {tune_type}. The tune '
+                             f'type needs to be `sequential` or `parallel`!')
+        t_ratios = list()
+        timesteps, timesteps_prev = self.get_timesteps(num_steps, timesteps)
+        num_tuned_timesteps = len(timesteps) - 1
+        for idx in trange(num_tuned_timesteps):
+            t_ratio = Variable(torch.ones(1)).cuda()
+            t_ratio.requires_grad = True
+            optimizer = Adam([t_ratio], lr=lr, betas=(0.9, 0.999))
+            for cur_iter, data_dict in enumerate(data_loader):
+                if cur_iter >= total_iters:
+                    break
+
+                x = data_dict.get('image').to(self.device)
+                if encode_fn is not None:
+                    x = encode_fn(x)
+                c = data_dict.get('label', None)
+                if c is not None and isinstance(c, torch.Tensor):
+                    c = c.to(self.device)
+                t = timesteps[idx]
+                t_prev = timesteps_prev[idx]
+                noise = torch.randn_like(x)
+
+                with torch.no_grad():
+                    if tune_type == 'sequential':
+                        T = torch.tensor(self.noise_schedule.T).cuda()
+                        alpha_T = self.noise_schedule.marginal_alpha(T)
+                        sigma_T = self.noise_schedule.marginal_std(T)
+                        x_inter = x * alpha_T + noise * sigma_T
+                        for s, s_prev, ratio in zip(timesteps[:idx],
+                                                    timesteps_prev[:idx],
+                                                    t_ratios[:idx]):
+                            x_inter, _ = step_fn(x_inter,
+                                                 s,
+                                                 s_prev,
+                                                 ratio,
+                                                 condition=c,
+                                                 **kwargs)
+                        x_t = x_inter
+                    else:
+                        alpha_t = self.noise_schedule.marginal_alpha(t)
+                        sigma_t = self.noise_schedule.marginal_std(t)
+                        x_t = x * alpha_t + noise * sigma_t
+                    eps_t = self.noise_predition_fn(x_t,
+                                                    t,
+                                                    condition=c,
+                                                    **kwargs)
+                x_t_prev, _ = step_fn(x_t,
+                                      t=t,
+                                      s=t_prev,
+                                      t_ratio=t_ratio,
+                                      condition=c,
+                                      **kwargs)
+                eps_t_prev = self.noise_predition_fn(x_t_prev,
+                                                     t_prev,
+                                                     condition=c,
+                                                     **kwargs)
+                loss = mean_flat((eps_t - eps_t_prev).square())
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                if verbose:
+                    msg = f'idx: {idx} / {num_tuned_timesteps}, '
+                    msg += f'# iters: {cur_iter} / {total_iters}, '
+                    msg += f'loss: {loss.item():.4f}, '
+                    msg += f't_ratio: {t_ratio.item():.4f}'
+                    print(msg)
+
+            t_ratios.append(t_ratio.detach().cpu().item())
+
+        return torch.tensor(t_ratios + [1.])
+
 
 def interpolate_fn(x, xp, yp):
     """

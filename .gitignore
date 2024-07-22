@@ -49,3 +49,4 @@ events.*
 
 # Files that should not be ignored.
 !/requirements/*
+!requirements.txt
